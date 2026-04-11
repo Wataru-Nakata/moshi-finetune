@@ -1,0 +1,61 @@
+# Fine-tune Moshi on Japanese podcast dialogue from podcast_crawl.
+#
+# Prerequisites:
+#   1. Run podcast_crawl → data/wds_ja/<JOB_ID>/<NODE_INDEX>/*.tar.gz
+#   2. Run scripts/filter_shards.py to produce
+#      data/wds_ja_filtered/<JOB_ID>/<NODE_INDEX>/*.tar.gz
+#   3. Run scripts/annotate_wds.py with --lang ja to produce matching
+#      data/wds_ja_transcripts/<JOB_ID>/<NODE_INDEX>/*.jsonl
+#
+# Then point `data.train_data` at the two roots joined by '+':
+#
+#   wds:<audio_root>+<transcript_root>[:weight]
+
+data:
+  eval_data: ''
+  shuffle: true
+  train_data: 'wds:/work/gj18/e43001/github.com/podcast_crawl/data/wds_ja_filtered+/work/gj18/e43001/github.com/podcast_crawl/data/wds_ja_transcripts'
+
+moshi_paths:
+  hf_repo_id: "kyutai/moshiko-pytorch-bf16"
+
+full_finetuning: false
+lora:
+  enable: true
+  rank: 128
+  scaling: 2.
+  ft_embed: false
+
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+
+# 300 s covers most dialogues in podcast_crawl in one window (the filter
+# caps dialogues at 600 s). Shorter dialogues are zero-padded. Scaling
+# from 100 s to 300 s makes self-attention roughly 9x more expensive, so
+# we drop batch_size accordingly.
+duration_sec: 300
+batch_size: 8
+max_steps: 20000
+gradient_checkpointing: true
+optim:
+  lr: 2e-6
+  weight_decay: 0.1
+  pct_start: 0.05
+
+seed: 0
+log_freq: 10
+eval_freq: 500
+do_eval: false
+do_ckpt: true
+ckpt_freq: 500
+
+save_adapters: true
+
+run_dir: "./runs/moshi_ja_wds"
+
+wandb:
+  project: "moshi-ja-podcast"
+  run_name: "moshi_7B_ja_wds_lora"
+  offline: false
+  # Set via env var WANDB_API_KEY so this file stays safe to commit.
+  # key: "..."

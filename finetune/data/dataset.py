@@ -12,6 +12,7 @@ import torch.distributed as dist
 from finetune.distributed import get_rank
 
 from .interleaver import InterleavedTokenizer, Sample
+from .wds_dataset import WDSDataSource, iter_wds_dataset
 
 logger = logging.getLogger("dataset")
 
@@ -85,18 +86,65 @@ class DataFile:
 
 def parse_data_sources(
     pretrain_data: str,
-) -> tuple[list[DataDir | DataFile], list[float]]:
+) -> tuple[list[DataDir | DataFile | WDSDataSource], list[float]]:
+    """Parse a comma-separated data source spec.
+
+    Each source is either:
+      - A plain path to a JSONL file or directory containing JSONL files,
+        optionally with ``:weight`` (legacy sphn loader).
+      - A WebDataset source written as
+        ``wds:<audio_root>+<transcript_root>[:weight]`` where ``audio_root``
+        contains the ``*.tar.gz`` shards and ``transcript_root`` contains the
+        matching ``*.jsonl`` files produced by ``scripts/annotate_wds.py``.
+    """
     seen: set[str] = set()
-    sources: list[DataDir | DataFile] = []
+    sources: list[DataDir | DataFile | WDSDataSource] = []
     weights: list[float] = []
 
     sample_sources = pretrain_data
 
     for source in sample_sources.strip().split(","):
+        source = source.strip()
         if not source:
             continue
 
-        source_items = source.strip().split(":")
+        if source.startswith("wds:"):
+            body = source[len("wds:"):]
+            # Optional :weight suffix — split off trailing ":<number>".
+            weight = 1.0
+            if ":" in body:
+                maybe_body, maybe_weight = body.rsplit(":", 1)
+                try:
+                    weight = float(maybe_weight)
+                    body = maybe_body
+                except ValueError:
+                    pass
+            if "+" not in body:
+                raise ValueError(
+                    f"WebDataset source {source!r} must be "
+                    "'wds:<audio_root>+<transcript_root>[:weight]'"
+                )
+            audio_root_str, transcript_root_str = body.split("+", 1)
+            audio_root = Path(audio_root_str)
+            transcript_root = Path(transcript_root_str)
+            if not audio_root.exists():
+                raise FileNotFoundError(f"audio_root does not exist: {audio_root}")
+            if not transcript_root.exists():
+                raise FileNotFoundError(
+                    f"transcript_root does not exist: {transcript_root}"
+                )
+            key = f"wds:{audio_root}+{transcript_root}"
+            assert key not in seen, f"{key} seems to be duplicated."
+            assert weight > 0, (
+                f"Make sure to define strictly positive data sampling weights, "
+                f"not {weight}"
+            )
+            sources.append(WDSDataSource(audio_root=audio_root, transcript_root=transcript_root))
+            weights.append(weight)
+            seen.add(key)
+            continue
+
+        source_items = source.split(":")
         if len(source_items) == 1:
             path_ = source_items[0]
             weight = 1.0
@@ -188,7 +236,7 @@ def get_rng(seed: int, rank: int) -> np.random.RandomState:
 
 
 def get_dataset_iterator(
-    source: DataDir | DataFile,
+    source: DataDir | DataFile | WDSDataSource,
     instruct_tokenizer: InterleavedTokenizer,
     rank: int,
     world_size: int,
@@ -196,6 +244,18 @@ def get_dataset_iterator(
     seed: int | None,
     shuffle_at_epoch: bool,
 ) -> Iterator[Sample]:
+    if isinstance(source, WDSDataSource):
+        yield from iter_wds_dataset(
+            source=source,
+            tokenizer=instruct_tokenizer,
+            rank=rank,
+            world_size=world_size,
+            is_finite=is_finite,
+            shuffle_at_epoch=shuffle_at_epoch,
+            seed=seed,
+        )
+        return
+
     epoch = 1
     while True:
         for jsonl_file in source.jsonl_files:

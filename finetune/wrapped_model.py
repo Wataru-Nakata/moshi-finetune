@@ -12,6 +12,7 @@ from moshi.modules.transformer import StreamingTransformerLayer
 from torch.distributed.fsdp import BackwardPrefetch
 from torch.distributed.fsdp.api import ShardingStrategy
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
+from torch.nn.parallel import DistributedDataParallel
 
 from .args import TrainArgs
 from .distributed import get_rank, get_world_size
@@ -97,7 +98,7 @@ def initialize_lora_parameters(model: torch.nn.Module, param_dtype: torch.dtype)
 
 def get_fsdp_model(
     args: TrainArgs, checkpointer_info: CheckpointInfo
-) -> FullyShardedDataParallel | LMModel:
+) -> Union[FullyShardedDataParallel, DistributedDataParallel, LMModel]:
     """
     Initializes and returns a FullyShardedDataParallel (FSDP) LMModel or a non sharded LMModel if one GPU available.
     Args:
@@ -186,13 +187,81 @@ def get_fsdp_model(
     if get_world_size() == 1:
         return model.cuda()
 
+    parallelism = getattr(args, "parallelism", "fsdp").lower()
+    world_size = get_world_size()
+
+    if parallelism == "ddp":
+        main_logger_info(
+            f"Replicating model via DDP over {get_world_size()} GPUs ..."
+        )
+        # On non-zero ranks the model was created on `meta`; materialize it
+        # on the local GPU before we broadcast weights. Rank 0 already has
+        # real parameters loaded from the checkpoint.
+        if get_rank() != 0:
+            assert param_init_fn is not None
+            model.apply(param_init_fn)
+            assert not any(p.is_meta for p in model.parameters()), (
+                "All parameters should be initialized by now"
+            )
+        else:
+            model = model.cuda()
+
+        # Make sure every rank has the same weights as rank 0 before DDP
+        # wrapping (DDP broadcasts on first forward by default, but the
+        # explicit barrier + sync here matches FSDP's sync_module_states).
+        torch.distributed.barrier()
+        for p in model.parameters():
+            torch.distributed.broadcast(p.data, src=0)
+        torch.distributed.barrier()
+
+        wrapped_model = DistributedDataParallel(
+            model,
+            device_ids=[torch.cuda.current_device()],
+            output_device=torch.cuda.current_device(),
+            find_unused_parameters=args.lora.enable and not args.full_finetuning,
+            gradient_as_bucket_view=True,
+            static_graph=False,
+        )
+        main_logger_info("Model replicated (DDP)!")
+        log_train_params(wrapped_model)
+        return wrapped_model
+
     auto_wrap_policy = get_fsdp_policy(args.lora.enable)
 
-    main_logger_info(f"Sharding model over {get_world_size()} GPUs ...")
+    # Select the sharding strategy + (optional) explicit process groups.
+    # HSDP ("hsdp") shards within a group of size `args.hsdp_shard_size`
+    # and replicates across the remaining ranks.
+    sharding_strategy = ShardingStrategy.FULL_SHARD
+    device_mesh = None
+    if parallelism == "hsdp":
+        shard_size = int(getattr(args, "hsdp_shard_size", 2))
+        assert world_size % shard_size == 0, (
+            f"world_size ({world_size}) must be divisible by hsdp_shard_size "
+            f"({shard_size}) when parallelism='hsdp'"
+        )
+        assert shard_size > 1, (
+            "hsdp_shard_size must be > 1 (use parallelism='ddp' for shard_size=1 "
+            "or parallelism='fsdp' to shard across every rank)"
+        )
+        replicate_size = world_size // shard_size
+        from torch.distributed.device_mesh import init_device_mesh
+
+        device_mesh = init_device_mesh(
+            "cuda",
+            mesh_shape=(replicate_size, shard_size),
+            mesh_dim_names=("replicate", "shard"),
+        )
+        sharding_strategy = ShardingStrategy.HYBRID_SHARD
+        main_logger_info(
+            f"HSDP: {replicate_size} replica groups × {shard_size}-way shard "
+            f"(world_size={world_size})"
+        )
+    else:
+        main_logger_info(f"Sharding model over {world_size} GPUs ...")
 
     wrapped_model = FullyShardedDataParallel(
         model,
-        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        sharding_strategy=sharding_strategy,
         auto_wrap_policy=auto_wrap_policy,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
         limit_all_gathers=True,
@@ -200,6 +269,7 @@ def get_fsdp_model(
         sync_module_states=True,
         param_init_fn=param_init_fn,
         use_orig_params=True,
+        device_mesh=device_mesh,
     )
 
     main_logger_info("Model sharded!")

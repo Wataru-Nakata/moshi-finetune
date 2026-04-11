@@ -11,8 +11,13 @@ dependencies = [
   "safetensors",
   "tensorboard",
   "tqdm",
-  "torch==2.6",
+  # torch + triton are pulled from the PyTorch cu126 index so aarch64
+  # (Miyabi-G / GH200) wheels are available. See [tool.uv.sources] below.
+  # moshi pins torch <2.7 so we use cu126 which ships torch 2.6.0 for aarch64.
+  "torch==2.6.0",
+  "torchaudio==2.6.0",
   "triton>=3.2",
+  "webdataset",
   # "git+https://git@github.com/kyutai-labs/moshi.git#egg=moshi&subdirectory=moshi",
   # We could also use [tool.uv.sources] to point to the git repo, but this maintains
   # compatibility with `pip install -e .`
@@ -25,7 +30,12 @@ dependencies = [
   "submitit",
   "llvmlite>=0.44",
   "numba>=0.61",
+  "wandb",
+  # wandb 0.25+ gencode needs protobuf runtime >= 6.31; pin to unblock.
+  "protobuf>=6.31.1",
 ]
+# Keep torchaudio ABI-aligned with torch 2.6.
+# (The cu126 index serves torchaudio 2.6.0 for aarch64.)
 
 [project.optional-dependencies]
 # We're putting dev dependencies here rather than [dependency-groups.dev] because
@@ -44,6 +54,19 @@ dev = [
 # The following fixes Pylance/VSCode not seeing the `finetune` package. See
 # https://github.com/astral-sh/uv/issues/3898
 config-settings = { editable_mode = "compat" }
+# bitsandbytes >= 0.45 only ships x86_64 wheels, so pin to the last
+# pure-python release for aarch64 (Miyabi-G / GH200) compatibility.
+override-dependencies = ["bitsandbytes==0.42.0"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126" }]
+torchaudio = [{ index = "pytorch-cu126" }]
+triton = [{ index = "pytorch-cu126" }]
 
 [tool.setuptools]
 packages = ["finetune"]
@@ -99,3 +122,6 @@ filterwarnings = [
 ]
 testpaths = []
 addopts = "--ignore=third_party --ignore=tokens"
+
+[tool.uv.extra-build-dependencies]
+openai-whisper = ["setuptools<80"]

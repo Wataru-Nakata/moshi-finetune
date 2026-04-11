@@ -106,3 +106,9 @@ cython_debug/
 example/debug_configs/
 
 
+
+# PBS / HPC job outputs and local data
+logs/
+/data/
+*.o[0-9]*
+core.*

@@ -139,6 +139,175 @@ python annotate.py {your jsonl file}
 This script can also be run in a distributed manner with SLURM using e.g.
 `--shards 64 --partition 'your-partition'`.
 
+### 🏔️ Installing on Miyabi-G / other aarch64 hosts
+
+The default install assumes x86_64. For Miyabi-G (GH200 / aarch64), the
+`pyproject.toml` is set up to pull torch/torchaudio/triton from the
+`download.pytorch.org/whl/cu126` index (which ships aarch64 wheels for torch
+2.6.0 and triton 3.6.0), and it pins `bitsandbytes==0.42.0` (the last release
+with a universal wheel).
+
+A few native dependencies (`sphn`, `audiopus_sys`) are built from source on
+aarch64 because there are no prebuilt wheels. To make that work you need:
+
+- Rust toolchain (`cargo`, `rustc`) on `PATH`. Install via rustup if not
+  already there.
+- A C/C++ toolchain. Force it to gcc (`nvc` from the NVIDIA HPC SDK fails to
+  build opus) via `CC`/`CXX` env vars.
+- System `libopus` exposed to the build. On Miyabi-G, miniconda3 ships it
+  under `/work/gj18/e43001/miniconda3`.
+
+First-time sync:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+export CC=/usr/bin/gcc CXX=/usr/bin/g++
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+export LIBRARY_PATH=/work/gj18/e43001/miniconda3/lib:${LIBRARY_PATH:-}
+export CPATH=/work/gj18/e43001/miniconda3/include:${CPATH:-}
+export LD_LIBRARY_PATH=/work/gj18/e43001/miniconda3/lib:${LD_LIBRARY_PATH:-}
+uv sync --python 3.12
+```
+
+After that, runtime just needs `LD_LIBRARY_PATH` set so `libopus.so.0`
+resolves — the PBS scripts below take care of that.
+
+### 🎙️ WebDataset shards from `podcast_crawl`
+
+You can also train directly from the WebDataset tar shards produced by
+[podcast_crawl](../podcast_crawl) (after running its `scripts/filter_shards.py`
+post-processing pass). Each sample is already a stereo MP3 where ch0/ch1 are
+the two speakers separated by DialogueSidon, so no file extraction is needed.
+
+#### 1. Transcribe both channels of every shard
+
+`scripts/annotate_wds.py` runs whisper-timestamped on **both** channels of
+each dialogue and writes one JSONL transcript file per input shard, mirrored
+under the output root:
+
+```sh
+uv run python3 scripts/annotate_wds.py \
+    --input  /path/to/podcast_crawl/data/wds_ja_filtered \
+    --output /path/to/podcast_crawl/data/wds_ja_transcripts \
+    --lang ja --whisper-model medium
+```
+
+It's safe to re-run — existing transcripts are skipped. For a PBS job array
+use `--shard $PBS_ARRAY_INDEX --num-shards 64` so every array task owns a
+disjoint subset of shards.
+
+The transcript files are structured as one line per audio sample:
+
+```json
+{"key": "<episode_sha1>_<dialogue_idx>",
+ "duration_sec": 74.6,
+ "sample_rate": 24000,
+ "alignments_ch0": [["こんにちは", [0.12, 0.81], "SPEAKER_A"], ...],
+ "alignments_ch1": [["はい", [1.05, 1.41], "SPEAKER_B"], ...]}
+```
+
+#### 2. Point training at the WDS source
+
+The training data spec has a new `wds:` prefix that takes two paths joined by
+`+`: the audio shard root and the transcript JSONL root. Optionally suffix
+with `:<weight>` for mixed-source sampling.
+
+```yaml
+data:
+  train_data: 'wds:/path/to/wds_ja_filtered+/path/to/wds_ja_transcripts'
+  shuffle: true
+```
+
+See `example/moshi_7B_ja_wds.yaml` for a complete config.
+
+#### 3. Data augmentation via channel swap
+
+For every audio sample, the WDS loader yields **two** training examples:
+one with ch0 as the "main" (Moshi) speaker, one with channels swapped and
+ch1 as the main speaker. This matches DialogueSidon's arbitrary channel
+assignment — there's no prior reason either speaker should be on ch0 — and
+doubles the effective dataset.
+
+No code changes are needed on your side; the loader does this automatically.
+
+#### 4. Parallelism: FSDP / DDP / HSDP
+
+`parallelism` in the training config picks how the model is distributed
+across ranks:
+
+| Mode  | What it does                                           | When to use                                                    |
+|-------|--------------------------------------------------------|---------------------------------------------------------------|
+| `fsdp` | FULL_SHARD across every rank (default)                 | Model too large for a single GPU.                              |
+| `ddp`  | Full model replicated per rank                         | Model fits per GPU (e.g. Moshi-7B on GH200). Simpler, faster. |
+| `hsdp` | HYBRID_SHARD: shard within groups, replicate across    | Large runs where FSDP all-gather ring size is the bottleneck. |
+
+Example yaml:
+
+```yaml
+parallelism: ddp       # or "fsdp" (default) or "hsdp"
+full_finetuning: true  # any of the three modes supports full FT
+lora:
+  enable: false
+save_adapters: false
+```
+
+See `example/moshi_7B_ja_wds_full_ddp.yaml` for a ready-to-use full
+fine-tuning + DDP config.
+
+**HSDP notes**. Set `parallelism: hsdp` and `hsdp_shard_size: N` where N
+divides `world_size`. HSDP creates a 2D device mesh
+(`replicate_size × shard_size`) and passes it to FSDP, which uses
+`HYBRID_SHARD`. With world_size=16 and `hsdp_shard_size=4`, you get 4
+replica groups × 4-way shard — each all-gather only goes across 4 ranks
+instead of 16, dramatically cutting cross-node comms at scale.
+
+Note: on Miyabi-G (1 GH200 per node) there's no intra-node NVLink
+shortcut, so every shard group spans multiple nodes regardless. HSDP is
+still useful because it caps the all-gather ring size, but it doesn't
+buy you a "fast bus" the way it does on 8-GPU servers.
+
+**Activation memory for long sequences**. `duration_sec` controls the
+training window size. At `duration_sec=100` (default) each window is
+1250 audio frames; at 600 (10 min) it's 7500. Activation memory scales
+linearly with sequence length, and FSDP/DDP/HSDP do **not** help with
+that — they shard parameters, not activations. If you hit OOM on long
+windows, the levers are `gradient_checkpointing: true`, lower
+`batch_size`, or smaller `duration_sec` with gradient accumulation via
+`num_microbatches`.
+
+The DDP path in `finetune/wrapped_model.py`:
+- materializes the full model on each rank (using `param_init_fn` for
+  ranks > 0 since the meta-device init pattern is shared with FSDP),
+- broadcasts rank-0 weights to all ranks to match FSDP's
+  `sync_module_states`,
+- wraps with `torch.nn.parallel.DistributedDataParallel`,
+  `find_unused_parameters=True` only when LoRA is enabled (frozen base
+  params).
+
+The checkpointer in `finetune/checkpointing.py` is DDP-aware: it skips
+`summon_full_params` (DDP has nothing to unshard) and just dumps the
+unwrapped `state_dict()` on rank 0. FSDP and HSDP share the same save
+path (via `summon_full_params`).
+
+#### 5. PBS job scripts for Miyabi-G
+
+Three sample PBS scripts at the repo root drive the pipeline on Miyabi-G:
+
+- **`run_annotate_ja_miyabi.sh`** — PBS array job (`#PBS -J 0-63`) that
+  shards the Whisper annotation across 64 parallel tasks. Each task calls
+  `scripts/annotate_wds.py --shard $PBS_ARRAY_INDEX --num-shards 64`.
+- **`run_train_ja_single_miyabi.sh`** — single-node (1× GH200) training
+  job. Use this first for a smoke test.
+- **`run_train_ja_miyabi.sh`** — multi-node training job. `mpirun` launches
+  one rank per node and each rank invokes `torchrun` with the right
+  `--node_rank` / `--master_addr` / `--master_port` for NCCL rendezvous.
+  Adjust `#PBS -l select=N` and `NUM_NODES=N` to scale.
+
+Submit with `qsub <script>`. All three set `LD_LIBRARY_PATH` so
+`libopus.so.0` resolves at runtime (needed by `sphn`), and the training
+scripts set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` which is
+important on GH200 for FSDP memory behavior.
+
 ## 🏋️ Start training
 
 Once your dataset is ready, start fine-tuning using the following steps.

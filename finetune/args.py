@@ -110,6 +110,19 @@ class TrainArgs(Serializable):
 
     param_dtype: str = "bfloat16"
 
+    # Parallelism strategy for multi-GPU training:
+    #   "fsdp"   — FULL_SHARD across every rank (PyTorch FSDP default).
+    #   "ddp"    — full model replicated per rank. Cheaper comms and
+    #              simpler checkpointing. Works on GH200 since Moshi-7B
+    #              fits even with full fine-tuning + AdamW.
+    #   "hsdp"   — Hybrid Sharded Data Parallel. Sharding happens within
+    #              shard groups of size `hsdp_shard_size`, and these
+    #              groups replicate to each other. Useful on large
+    #              multi-node runs to cap the all-gather ring size.
+    #              `hsdp_shard_size` must divide the world size.
+    parallelism: str = "fsdp"
+    hsdp_shard_size: int = 2
+
     overwrite_run_dir: bool = False
 
     def __post_init__(self) -> None:

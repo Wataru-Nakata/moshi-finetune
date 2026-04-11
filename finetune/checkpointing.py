@@ -9,9 +9,19 @@ from moshi.models.lm import LMModel
 from moshi.modules.lora import LoRALinear
 from torch.distributed import barrier
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel
+from torch.nn.parallel import DistributedDataParallel
 
 from .distributed import get_rank, get_world_size
 from .utils import TrainState
+
+
+def _is_ddp(model: torch.nn.Module) -> bool:
+    return isinstance(model, DistributedDataParallel)
+
+
+def _unwrap_ddp(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying module if `model` is DDP-wrapped."""
+    return model.module if isinstance(model, DistributedDataParallel) else model
 
 logger = logging.getLogger("checkpointing")
 
@@ -107,13 +117,16 @@ class Checkpointer:
             if isinstance(module, LoRALinear) and hasattr(module, "_merge_lora_handle"):
                 module._merge_lora_handle.remove()  # type: ignore
 
-        offload_to_cpu = get_world_size() > 1
+        offload_to_cpu = get_world_size() > 1 and not _is_ddp(self.model)
+        # With DDP every rank already holds the full model, so we can treat
+        # saving exactly like the single-GPU path (no summon_full_params).
+        full_replica = get_world_size() == 1 or _is_ddp(self.model)
         if save_only_lora:
 
             def is_trainable_fsdp(module: torch.nn.Module | FullyShardedDataParallel):
                 is_fsdp = (
                     isinstance(module, FullyShardedDataParallel)
-                    or get_world_size() == 1
+                    or full_replica
                 )
                 all_params_have_grads = is_fsdp and all(
                     p.requires_grad for p in module.parameters()
@@ -121,28 +134,29 @@ class Checkpointer:
 
                 # need to make sure only lowest fsdp wrap is used
                 is_leaf_node = is_fsdp and (
-                    get_world_size() == 1 or len(list(module.module.children())) == 0
+                    full_replica or len(list(module.module.children())) == 0
                 )  # type: ignore
 
                 return is_fsdp and all_params_have_grads and is_leaf_node
 
             # extract all modules with only trainable weights
+            walk_model = _unwrap_ddp(self.model)
             modules = {
-                k: m for k, m in self.model.named_modules() if is_trainable_fsdp(m)
+                k: m for k, m in walk_model.named_modules() if is_trainable_fsdp(m)
             }
 
             states = {}
             for key, module in modules.items():
                 assert (
                     isinstance(module, FullyShardedDataParallel)
-                    or get_world_size() == 1
+                    or full_replica
                 ), (
-                    "`module` should be an instance of `FullyShardedDataParallel` if `world_size > 1`"
+                    "`module` should be FSDP or DDP/single-GPU when world_size > 1"
                 )
                 parent_prefix = key.replace("_fsdp_wrapped_module.", "").replace(
                     "_checkpoint_wrapped_module.", ""
                 )
-                if get_world_size() > 1:
+                if isinstance(module, FullyShardedDataParallel):
                     with module.summon_full_params(
                         module, writeback=True, offload_to_cpu=offload_to_cpu
                     ):
@@ -179,18 +193,20 @@ class Checkpointer:
             # make sure you have enough CPU RAM available to save the full model
             assert (
                 isinstance(self.model, FullyShardedDataParallel)
-                or get_world_size() == 1
+                or full_replica
             ), (
-                "`self.model` should be an instance of `FullyShardedDataParallel` if `world_size > 1`"
+                "`self.model` should be FSDP or DDP/single-GPU when world_size > 1"
             )
-            if get_world_size() > 1:
+            if isinstance(self.model, FullyShardedDataParallel):
                 with self.model.summon_full_params(
                     self.model, writeback=True, offload_to_cpu=offload_to_cpu
                 ):
                     states = self.get_non_lora_states(self.model.state_dict())
                     states = {k: v.to(dtype=save_dtype) for k, v in states.items()}
             else:
-                states = self.get_non_lora_states(self.model.state_dict())
+                # DDP or single-GPU: unwrap and dump the full state dict.
+                inner = _unwrap_ddp(self.model)
+                states = self.get_non_lora_states(inner.state_dict())
                 states = {k: v.clone().to(dtype=save_dtype) for k, v in states.items()}
 
         states = dict(sorted(states.items()))

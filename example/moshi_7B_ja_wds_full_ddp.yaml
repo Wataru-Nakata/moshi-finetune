@@ -1,0 +1,57 @@
+# Full fine-tuning of Moshi-7B on Japanese podcast dialogue via DDP.
+#
+# Moshi-7B in bfloat16 fits on a single GH200 (120 GB) with gradient
+# checkpointing, so we use DDP (full model replicated per rank) instead of
+# FSDP. DDP has lower comms overhead and simpler checkpointing; it's the
+# right default when the model fits.
+
+data:
+  eval_data: ''
+  shuffle: true
+  train_data: 'wds:/work/gj18/e43001/github.com/podcast_crawl/data/wds_ja_filtered+/work/gj18/e43001/github.com/podcast_crawl/data/wds_ja_transcripts'
+
+moshi_paths:
+  hf_repo_id: "kyutai/moshiko-pytorch-bf16"
+
+# Full fine-tuning: no LoRA adapters, every parameter is trainable.
+full_finetuning: true
+lora:
+  enable: false
+save_adapters: false
+
+# DDP instead of FSDP (new flag; defaults to "fsdp" elsewhere).
+parallelism: ddp
+
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+
+# Keep batch small per-GPU for full FT with activations; scale by NUM_NODES.
+# 300 s windows cover most dialogues in one pass. Full fine-tuning +
+# longer sequences = more activation memory, so we keep batch_size small
+# per GPU and accumulate via num_microbatches.
+duration_sec: 300
+batch_size: 2
+num_microbatches: 8
+max_steps: 20000
+gradient_checkpointing: true
+
+optim:
+  lr: 1e-5
+  weight_decay: 0.1
+  pct_start: 0.05
+
+seed: 0
+log_freq: 10
+eval_freq: 500
+do_eval: false
+do_ckpt: true
+ckpt_freq: 500
+
+run_dir: "./runs/moshi_ja_wds_full_ddp"
+
+wandb:
+  project: "moshi-ja-podcast"
+  run_name: "moshi_7B_ja_wds_full_ddp"
+  offline: false
+  # Set via env var WANDB_API_KEY so this file stays safe to commit.
+  # key: "..."
