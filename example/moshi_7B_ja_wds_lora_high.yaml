@@ -1,0 +1,45 @@
+# Higher LoRA rank + embedding fine-tuning for stronger Japanese adaptation.
+
+data:
+  eval_data: ''
+  shuffle: true
+  train_data: 'tokens:/work/gj18/e43001/github.com/moshi-finetune/data/tokens_test'
+
+moshi_paths:
+  hf_repo_id: "kyutai/moshiko-pytorch-bf16"
+
+full_finetuning: false
+parallelism: ddp
+lora:
+  enable: true
+  rank: 256
+  scaling: 2.
+  ft_embed: true  # fine-tune embedding layer for language adaptation
+
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+
+duration_sec: 300
+batch_size: 8
+max_steps: 20000
+gradient_checkpointing: true
+optim:
+  lr: 2e-6
+  weight_decay: 0.1
+  pct_start: 0.05
+
+seed: 0
+log_freq: 10
+eval_freq: 500
+do_eval: false
+do_ckpt: true
+ckpt_freq: 500
+
+save_adapters: true
+
+run_dir: "./runs/moshi_ja_wds_lora_high"
+
+wandb:
+  project: "moshi-ja-podcast"
+  run_name: "moshi_7B_ja_lora256_embed"
+  offline: false

@@ -1,20 +1,20 @@
 """Pre-compute mimi audio tokens for podcast_crawl WebDataset shards.
 
-Reads filtered shards + transcript JSONLs, runs mimi.encode on both
-channel orientations, and saves tokenized samples as JSONL. Training
-then reads tokens directly — no audio decoding or mimi encoding needed.
+Single-process, pipelined:
+  [Reader threads] → decode_queue → [GPU: batch mimi.encode] → write_queue → [Writer thread]
 
-Output: one .jsonl per input shard under --output:
-    {"key": "abc_w000", "audio_tokens_ch0main": [[...], ...],
-     "audio_tokens_ch1main": [[...], ...], "alignments_ch0": [...],
-     "alignments_ch1": [...], "num_real_frames": 3750, "duration_sec": 300}
+- Reader threads: read tar.gz + decode MP3 (CPU, parallel)
+- Main thread: batch mimi.encode with streaming for long audio (GPU)
+- Writer thread: serialize JSON + write to Lustre (async)
+
+No per-sample padding — actual frame lengths are stored. Packing
+happens at training time in tokenized_dataset.py.
 
 Usage:
     .venv/bin/python3 scripts/tokenize_wds.py \
         --input data/wds_ja_filtered \
         --transcripts data/wds_ja_transcripts \
-        --output data/wds_ja_tokens \
-        --duration-sec 300
+        --output data/wds_ja_tokens
 
 PBS array: --shard $INDEX --num-shards 64
 """
@@ -37,10 +37,15 @@ import numpy as np
 import torch
 
 LOGGER = logging.getLogger("tokenize_wds")
-NUM_DECODE_WORKERS = 4
+
+ENCODE_BATCH = 8          # samples per mimi.encode batch
+STREAM_CHUNK_SEC = 30.0   # streaming encode chunk size for long audio
+READER_WORKERS = 4        # CPU decode threads
+DECODE_QUEUE_SIZE = 32    # pre-decoded samples buffer
+WRITE_QUEUE_SIZE = 64     # pending JSONL lines buffer
 
 
-# ── Audio helpers (same as wds_dataset.py) ───────────────────────────────
+# ── Audio helpers ────────────────────────────────────────────────────────
 
 def _decode_stereo(audio_bytes: bytes) -> tuple[np.ndarray, int]:
     import sphn
@@ -119,7 +124,112 @@ def _load_transcripts(jsonl_path: Path) -> dict[str, dict]:
     return out
 
 
-# ── Tokenize one shard ───────────────────────────────────────────────────
+# ── Streaming mimi encode ────────────────────────────────────────────────
+
+@torch.inference_mode()
+def _encode_streaming(mimi, stereo: np.ndarray, target_sr: int) -> torch.Tensor:
+    """Encode stereo audio with streaming to limit peak GPU memory.
+
+    Splits audio into STREAM_CHUNK_SEC chunks and encodes sequentially
+    using mimi's streaming mode, then concatenates the token chunks.
+    Returns (n_channels_codebooks, total_frames) on CPU.
+    """
+    chunk_samples = int(STREAM_CHUNK_SEC * target_sr)
+    total_samples = stereo.shape[-1]
+
+    if total_samples <= chunk_samples * 2:
+        # Short enough — encode in one shot
+        t = torch.from_numpy(stereo).cuda()
+        tokens = mimi.encode(t[:, None])  # (2, n_cb, T_frames)
+        return tokens.cpu()
+
+    # Streaming encode for long audio
+    token_chunks = []
+    with mimi.streaming(batch_size=2):  # batch=2 for stereo channels
+        for start in range(0, total_samples, chunk_samples):
+            end = min(start + chunk_samples, total_samples)
+            chunk = stereo[:, start:end]
+            t = torch.from_numpy(chunk).cuda()
+            tokens = mimi.encode(t[:, None])
+            if tokens.shape[-1] > 0:
+                token_chunks.append(tokens.cpu())
+
+    if not token_chunks:
+        return torch.zeros(2, 8, 0, dtype=torch.long)
+    return torch.cat(token_chunks, dim=-1)
+
+
+@torch.inference_mode()
+def _encode_batch(mimi, items: list[tuple[np.ndarray, np.ndarray]], target_sr: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Batch-encode multiple (stereo, swapped) pairs.
+
+    Short samples are batched together for a single mimi.encode call.
+    Long samples fall back to streaming encode.
+    Returns list of (tokens_ch0main, tokens_ch1main) on CPU.
+    """
+    chunk_samples = int(STREAM_CHUNK_SEC * target_sr * 2)
+    results: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    # Separate into short (batchable) and long (streaming)
+    short_items: list[tuple[int, np.ndarray, np.ndarray]] = []
+    for idx, (stereo, swapped) in enumerate(items):
+        if stereo.shape[-1] > chunk_samples:
+            # Encode long audio with streaming
+            tok_ch0 = _encode_streaming(mimi, stereo, target_sr)
+            tok_ch1 = _encode_streaming(mimi, swapped, target_sr)
+            results.append((tok_ch0, tok_ch1))
+        else:
+            short_items.append((idx, stereo, swapped))
+            results.append((None, None))  # placeholder
+
+    if short_items:
+        # Batch encode short items: pad to max length, stack
+        max_len = max(s.shape[-1] for _, s, _ in short_items)
+
+        # Batch ch0-main
+        batch_ch0 = []
+        batch_ch1 = []
+        for _, stereo, swapped in short_items:
+            padded = np.zeros((2, max_len), dtype=np.float32)
+            padded[:, :stereo.shape[-1]] = stereo
+            batch_ch0.append(padded)
+
+            padded_s = np.zeros((2, max_len), dtype=np.float32)
+            padded_s[:, :swapped.shape[-1]] = swapped
+            batch_ch1.append(padded_s)
+
+        # Stack: (N*2, 1, max_len) for mimi
+        all_audio = np.concatenate(batch_ch0 + batch_ch1, axis=0)  # (N*2*2, max_len)
+        # Reshape for mimi: treat as batch of mono? No — mimi expects (batch, channels, T)
+        # Each item is (2, T) stereo. Stack N items: (N, 2, T)
+        ch0_batch = np.stack(batch_ch0, axis=0)  # (N, 2, max_len)
+        ch1_batch = np.stack(batch_ch1, axis=0)  # (N, 2, max_len)
+
+        # Encode: mimi expects (batch*2, 1, T) — flatten channels into batch
+        ch0_t = torch.from_numpy(ch0_batch.reshape(-1, 1, max_len)).cuda()
+        ch1_t = torch.from_numpy(ch1_batch.reshape(-1, 1, max_len)).cuda()
+
+        tok_ch0_all = mimi.encode(ch0_t)  # (N*2, n_cb, T_frames)
+        tok_ch1_all = mimi.encode(ch1_t)
+
+        # Split back into per-item, reshaping (2, n_cb, T)
+        n = len(short_items)
+        n_cb = tok_ch0_all.shape[1]
+        t_frames = tok_ch0_all.shape[2]
+        tok_ch0_all = tok_ch0_all.view(n, 2, n_cb, t_frames)
+        tok_ch1_all = tok_ch1_all.view(n, 2, n_cb, t_frames)
+
+        for i, (idx, stereo, _) in enumerate(short_items):
+            real_frames = int(stereo.shape[-1] / max_len * t_frames) if max_len > 0 else 0
+            # Reshape (2, n_cb, T) → keep only real frames
+            t0 = tok_ch0_all[i, :, :, :].cpu()
+            t1 = tok_ch1_all[i, :, :, :].cpu()
+            results[idx] = (t0, t1)
+
+    return results
+
+
+# ── Per-shard tokenize ───────────────────────────────────────────────────
 
 @torch.inference_mode()
 def tokenize_shard(
@@ -129,14 +239,15 @@ def tokenize_shard(
     mimi,
     target_sr: int,
     duration_sec: float,
+    decode_queue: queue.Queue,
+    write_queue: queue.Queue,
 ) -> tuple[int, int]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     frame_rate = mimi.frame_rate
-    num_frames = int(duration_sec * frame_rate)
 
     transcripts = _load_transcripts(transcript_path)
 
-    # Resume: skip already-tokenized keys
+    # Resume
     done_keys: set[str] = set()
     if output_path.exists():
         with open(output_path) as f:
@@ -148,112 +259,102 @@ def tokenize_shard(
 
     raw_samples = _read_shard_audio(shard_path, done_keys)
 
-    # ── Background decode (CPU) ──────────────────────────────────────
+    # ── Background decode ────────────────────────────────────────────
     _DONE = object()
-    decode_q: queue.Queue = queue.Queue(maxsize=8)
 
     def _decode_worker():
         for key, audio_bytes in raw_samples:
             if key not in transcripts:
-                decode_q.put((key, None, None, None, "no_transcript"))
                 continue
             try:
                 wav, sr = _decode_stereo(audio_bytes)
                 stereo = _prepare_stereo(wav, sr, target_sr)
-                decode_q.put((key, stereo, transcripts[key], None, None))
+                decode_queue.put((key, stereo, transcripts[key]))
             except Exception as exc:
-                decode_q.put((key, None, None, None, str(exc)))
-        decode_q.put(_DONE)
+                LOGGER.warning("decode failed %s: %s", key, exc)
+        decode_queue.put(_DONE)
 
-    decode_thread = threading.Thread(target=_decode_worker, daemon=True)
-    decode_thread.start()
+    decoder = threading.Thread(target=_decode_worker, daemon=True)
+    decoder.start()
 
-    # ── Background writer (I/O) ──────────────────────────────────────
-    write_q: queue.Queue = queue.Queue(maxsize=32)
-    _WRITE_DONE = object()
-
-    def _write_worker():
-        with open(output_path, "a", encoding="utf-8") as fp:
-            while True:
-                item = write_q.get()
-                if item is _WRITE_DONE:
-                    return
-                fp.write(item + "\n")
-                fp.flush()
-
-    write_thread = threading.Thread(target=_write_worker, daemon=True)
-    write_thread.start()
-
-    # ── Main loop: mimi encode (GPU) + enqueue writes ────────────────
+    # ── Main loop: batch mimi encode ─────────────────────────────────
     processed = 0
     errors = 0
+    batch_items: list[tuple[str, np.ndarray, np.ndarray, dict]] = []
+
+    def _flush_batch():
+        nonlocal processed, errors
+        if not batch_items:
+            return
+
+        audio_pairs = [(stereo, stereo[[1, 0], :]) for _, stereo, _, _ in batch_items]
+        try:
+            encoded = _encode_batch(mimi, audio_pairs, target_sr)
+        except RuntimeError as exc:
+            LOGGER.warning("encode batch failed: %s", exc)
+            errors += len(batch_items)
+            batch_items.clear()
+            return
+
+        for (key, stereo, _, rec), (tok_ch0, tok_ch1) in zip(batch_items, encoded):
+            if tok_ch0 is None:
+                errors += 1
+                continue
+
+            alignments_ch0 = rec.get("alignments_ch0") or []
+            alignments_ch1 = rec.get("alignments_ch1") or []
+            total_sec = stereo.shape[-1] / target_sr
+
+            # Slide windows
+            start_sec = 0.0
+            win_idx = 0
+            while start_sec < total_sec:
+                end_sec = min(start_sec + duration_sec, total_sec)
+                s_frame = int(start_sec * frame_rate)
+                e_frame = int(end_sec * frame_rate)
+                if e_frame <= s_frame:
+                    break
+
+                t0 = tok_ch0[:, :, s_frame:e_frame].tolist()
+                t1 = tok_ch1[:, :, s_frame:e_frame].tolist()
+                real_frames = e_frame - s_frame
+
+                def shift(aligns, offset, dur):
+                    return [
+                        [a[0], [a[1][0] - offset, a[1][1] - offset], a[2]]
+                        for a in aligns
+                        if a[1][1] > offset and a[1][0] < offset + dur
+                    ]
+
+                record = json.dumps({
+                    "key": f"{key}_w{win_idx:03d}",
+                    "audio_tokens_ch0main": t0,
+                    "audio_tokens_ch1main": t1,
+                    "alignments_ch0": shift(alignments_ch0, start_sec, duration_sec),
+                    "alignments_ch1": shift(alignments_ch1, start_sec, duration_sec),
+                    "num_real_frames": real_frames,
+                    "duration_sec": end_sec - start_sec,
+                }, ensure_ascii=False)
+                write_queue.put((output_path, record))
+
+                start_sec += duration_sec
+                win_idx += 1
+
+            processed += 1
+
+        batch_items.clear()
 
     while True:
-        item = decode_q.get()
+        item = decode_queue.get()
         if item is _DONE:
             break
-        key, stereo, rec, _, err = item
-        if stereo is None:
-            if err and err != "no_transcript":
-                LOGGER.warning("decode failed %s: %s", key, err)
-                errors += 1
-            continue
+        key, stereo, rec = item
+        batch_items.append((key, stereo, stereo[[1, 0], :], rec))
+        if len(batch_items) >= ENCODE_BATCH:
+            _flush_batch()
 
-        alignments_ch0 = rec.get("alignments_ch0") or []
-        alignments_ch1 = rec.get("alignments_ch1") or []
-        total_sec = stereo.shape[-1] / target_sr
-
-        start_sec = 0.0
-        win_idx = 0
-        while start_sec < total_sec:
-            end_sec = min(start_sec + duration_sec, total_sec)
-            s0 = int(start_sec * target_sr)
-            s1 = int(end_sec * target_sr)
-            if s1 <= s0:
-                break
-
-            window = stereo[:, s0:s1]
-            swapped = window[[1, 0], :]
-
-            # mimi encode both orientations
-            w_t = torch.from_numpy(window).cuda()
-            s_t = torch.from_numpy(swapped).cuda()
-            tok_ch0 = mimi.encode(w_t[:, None])   # (batch, n_cb, T)
-            tok_ch1 = mimi.encode(s_t[:, None])
-
-            real_frames = tok_ch0.shape[-1]
-
-            # No padding — store actual length. Packing happens at training time.
-            tok_ch0 = tok_ch0.squeeze(0).cpu().tolist()
-            tok_ch1 = tok_ch1.squeeze(0).cpu().tolist()
-
-            # Shift alignments to window-relative
-            def shift(aligns, offset, dur):
-                return [
-                    [a[0], [a[1][0] - offset, a[1][1] - offset], a[2]]
-                    for a in aligns
-                    if a[1][1] > offset and a[1][0] < offset + dur
-                ]
-
-            record = {
-                "key": f"{key}_w{win_idx:03d}",
-                "audio_tokens_ch0main": tok_ch0,
-                "audio_tokens_ch1main": tok_ch1,
-                "alignments_ch0": shift(alignments_ch0, start_sec, duration_sec),
-                "alignments_ch1": shift(alignments_ch1, start_sec, duration_sec),
-                "num_real_frames": real_frames,
-                "duration_sec": end_sec - start_sec,
-            }
-            write_q.put(json.dumps(record, ensure_ascii=False))
-
-            start_sec += duration_sec
-            win_idx += 1
-
-        processed += 1
-
-    write_q.put(_WRITE_DONE)
-    write_thread.join()
-    decode_thread.join()
+    _flush_batch()
+    decoder.join()
     return processed, errors
 
 
@@ -284,7 +385,10 @@ def main() -> None:
     LOGGER.info("Loading mimi from %s", args.moshi_repo)
     from huggingface_hub import hf_hub_download
     from moshi.models import loaders
-    mimi_path = hf_hub_download(repo_id=args.moshi_repo, filename="tokenizer-e351c8d8-checkpoint125.safetensors")
+    mimi_path = hf_hub_download(
+        repo_id=args.moshi_repo,
+        filename="tokenizer-e351c8d8-checkpoint125.safetensors",
+    )
     mimi = loaders.get_mimi(mimi_path, device="cuda")
     mimi.eval()
     target_sr = mimi.sample_rate
@@ -299,7 +403,31 @@ def main() -> None:
         shards = shards[: args.max_shards]
     LOGGER.info("worker %d/%d processing %d shards", args.shard, args.num_shards, len(shards))
 
-    # Prefetch next shard's tar reading while GPU tokenizes current
+    # Shared queues
+    decode_q: queue.Queue = queue.Queue(maxsize=DECODE_QUEUE_SIZE)
+
+    # Background writer: receives (output_path, json_line) tuples
+    write_q: queue.Queue = queue.Queue(maxsize=WRITE_QUEUE_SIZE)
+    _WRITE_DONE = object()
+    open_files: dict[Path, object] = {}
+
+    def _writer_loop():
+        while True:
+            item = write_q.get()
+            if item is _WRITE_DONE:
+                break
+            path, line = item
+            if path not in open_files:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                open_files[path] = open(path, "a", encoding="utf-8")
+            open_files[path].write(line + "\n")
+            open_files[path].flush()
+        for fp in open_files.values():
+            fp.close()
+
+    writer = threading.Thread(target=_writer_loop, daemon=True)
+    writer.start()
+
     total_p, total_e = 0, 0
     for i, shard_path in enumerate(shards):
         rel = shard_path.relative_to(args.input)
@@ -314,6 +442,7 @@ def main() -> None:
             n, e = tokenize_shard(
                 shard_path, transcript_path, output_path,
                 mimi, target_sr, args.duration_sec,
+                decode_q, write_q,
             )
         except RuntimeError as exc:
             if "cuda" in repr(exc).lower():
@@ -324,6 +453,8 @@ def main() -> None:
         total_e += e
         LOGGER.info("shard done: processed=%d errors=%d (total=%d)", n, e, total_p)
 
+    write_q.put(_WRITE_DONE)
+    writer.join()
     LOGGER.info("ALL DONE processed=%d errors=%d", total_p, total_e)
 
 

@@ -58,7 +58,7 @@ def _to_alignment(raw: list, speaker_label: str) -> list[Alignment]:
 
 
 def _build_sample_from_tokens(
-    audio_tokens: list[list[int]],
+    audio_tokens: list[list],
     alignments: list[Alignment],
     main_speaker: str,
     tokenizer: InterleavedTokenizer,
@@ -66,9 +66,21 @@ def _build_sample_from_tokens(
 ) -> Sample:
     """Build a training Sample from pre-computed mimi tokens + alignments."""
     with torch.no_grad():
-        # Reconstruct audio token tensor: (1, n_codebooks, T)
-        tokens_tensor = torch.tensor(audio_tokens, dtype=torch.long, device="cuda")
-        tokens_tensor = tokens_tensor.unsqueeze(0)  # (1, n_cb, T)
+        # Reconstruct audio token tensor. Handles both:
+        # - regular: list[list[int]] shape (n_cb, T) or (n_ch, n_cb, T)
+        # - packed: codebooks may already be concatenated as flat lists
+        # Use per-codebook tensor construction to handle jagged lengths safely.
+        if isinstance(audio_tokens[0][0], list):
+            # Shape (n_ch, n_cb, T) — flatten channels into codebooks
+            flat = []
+            for ch in audio_tokens:
+                for cb in ch:
+                    flat.append(torch.tensor(cb, dtype=torch.long, device="cuda"))
+            tokens_tensor = torch.stack(flat).unsqueeze(0)  # (1, n_ch*n_cb, T)
+        else:
+            # Shape (n_cb, T)
+            cbs = [torch.tensor(cb, dtype=torch.long, device="cuda") for cb in audio_tokens]
+            tokens_tensor = torch.stack(cbs).unsqueeze(0)  # (1, n_cb, T)
         tokens_tensor = tokens_tensor[..., : tokenizer.num_audio_frames]
 
         this_num_frames = min(num_real_frames, tokenizer.num_audio_frames)
@@ -173,36 +185,58 @@ def iter_tokenized_dataset(
         """Pack multiple short samples into one fixed-length Sample by
         concatenating audio tokens along the time axis."""
         target_frames = tokenizer.num_audio_frames
-        n_codebooks = len(items[0].audio_tokens)
 
-        # Concatenate audio tokens from all items
-        packed_tokens = [[] for _ in range(n_codebooks)]
+        # Determine token structure: (n_ch, n_cb, T) or (n_cb, T)
+        first = items[0].audio_tokens
+        if isinstance(first[0][0], list):
+            # (n_ch, n_cb, T) structure
+            n_ch = len(first)
+            n_cb = len(first[0])
+            packed = [[[] for _ in range(n_cb)] for _ in range(n_ch)]
+        else:
+            # (n_cb, T) structure
+            n_ch = 0
+            n_cb = len(first)
+            packed = [[] for _ in range(n_cb)]
+
         packed_aligns: list[Alignment] = []
         offset_frames = 0
 
         for item in items:
             real = item.num_real_frames
-            for cb in range(n_codebooks):
-                packed_tokens[cb].extend(item.audio_tokens[cb][:real])
+            if n_ch > 0:
+                for ch in range(n_ch):
+                    for cb in range(n_cb):
+                        packed[ch][cb].extend(item.audio_tokens[ch][cb][:real])
+            else:
+                for cb in range(n_cb):
+                    packed[cb].extend(item.audio_tokens[cb][:real])
 
-            # Shift alignments by current offset
             offset_sec = offset_frames / tokenizer.interleaver.audio_frame_rate
             for text, (s, e), spk in item.alignments:
                 packed_aligns.append((text, (s + offset_sec, e + offset_sec), spk))
 
             offset_frames += real
 
-        # Pad to target length
         total_real = min(offset_frames, target_frames)
-        for cb in range(n_codebooks):
-            packed_tokens[cb] = packed_tokens[cb][:target_frames]
-            if len(packed_tokens[cb]) < target_frames:
-                packed_tokens[cb].extend(
-                    [0] * (target_frames - len(packed_tokens[cb]))
-                )
+
+        # Pad to target length
+        if n_ch > 0:
+            for ch in range(n_ch):
+                for cb in range(n_cb):
+                    packed[ch][cb] = packed[ch][cb][:target_frames]
+                    pad_len = target_frames - len(packed[ch][cb])
+                    if pad_len > 0:
+                        packed[ch][cb].extend([0] * pad_len)
+        else:
+            for cb in range(n_cb):
+                packed[cb] = packed[cb][:target_frames]
+                pad_len = target_frames - len(packed[cb])
+                if pad_len > 0:
+                    packed[cb].extend([0] * pad_len)
 
         return _build_sample_from_tokens(
-            packed_tokens, packed_aligns, items[0].main_speaker,
+            packed, packed_aligns, items[0].main_speaker,
             tokenizer, total_real,
         )
 
