@@ -29,9 +29,14 @@ Each transcript JSONL entry:
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
+import queue
+import tarfile
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -40,7 +45,6 @@ import numpy as np
 import sphn
 import torch
 import torchaudio.functional as F_audio
-import webdataset as wds
 
 from .interleaver import Alignment, InterleavedTokenizer, Sample
 
@@ -124,73 +128,113 @@ def _prepare_stereo(wav: np.ndarray, src_sr: int, target_sr: int) -> np.ndarray:
     return wav.astype(np.float32, copy=False)
 
 
-def _iter_shard(
+def _read_shard_audio(shard_path: Path) -> list[tuple[str, bytes]]:
+    """Read (key, audio_bytes) from a .tar.gz using tolerant tarfile reader."""
+    samples: list[tuple[str, bytes]] = []
+    try:
+        with gzip.open(shard_path, "rb") as gz:
+            with tarfile.open(fileobj=gz, mode="r|") as tf:
+                current_key: str | None = None
+                current_audio: bytes | None = None
+                for member in tf:
+                    if not member.isfile():
+                        continue
+                    try:
+                        f = tf.extractfile(member)
+                        if f is None:
+                            continue
+                        data = f.read()
+                    except Exception:
+                        break
+                    name = member.name
+                    dot = name.find(".")
+                    if dot < 0:
+                        continue
+                    key = name[:dot]
+                    ext = name[dot + 1:]
+                    if key != current_key:
+                        if current_key and current_audio:
+                            samples.append((current_key, current_audio))
+                        current_key = key
+                        current_audio = None
+                    if ext == "audio.mp3":
+                        current_audio = data
+                if current_key and current_audio:
+                    samples.append((current_key, current_audio))
+    except (EOFError, OSError):
+        pass
+    return samples
+
+
+@dataclass
+class _DecodedItem:
+    """CPU-decoded item ready for GPU encoding."""
+    key: str
+    stereo: np.ndarray  # (2, T) at target_sr
+    alignments: list[Alignment]
+    duration_sec: float
+    target_sr: int
+
+
+def _decode_shard_items(
     shard_path: Path,
     transcript_path: Path,
-    tokenizer: InterleavedTokenizer,
-) -> Iterator[Sample]:
-    """Yield Sample objects for every audio entry in `shard_path`.
-
-    Each entry yields TWO samples: one with ch0 as main, one with swapped
-    channels and ch1 as main. The duration slicing logic mirrors the sphn
-    loader's fixed-window behavior.
-    """
+    target_sr: int,
+) -> list[_DecodedItem]:
+    """CPU-only: read shard, decode MP3, resample. No GPU ops."""
     transcripts = _load_transcripts(transcript_path)
-    duration_sec = tokenizer.duration_sec
-    target_sr = tokenizer.mimi.sample_rate
+    items: list[_DecodedItem] = []
 
-    ds = wds.WebDataset(
-        str(shard_path),
-        shardshuffle=False,
-        handler=wds.handlers.warn_and_continue,
-    )
-    for sample in ds:
-        key = sample.get("__key__", "")
-        audio_bytes = sample.get("audio.mp3")
-        if not audio_bytes or key not in transcripts:
+    for key, audio_bytes in _read_shard_audio(shard_path):
+        if key not in transcripts:
             continue
-
         rec = transcripts[key]
         align_a = _to_alignments(rec.get("alignments_ch0") or [], MAIN_SPEAKER_A)
         align_b = _to_alignments(rec.get("alignments_ch1") or [], MAIN_SPEAKER_B)
         if not align_a and not align_b:
             continue
-
         try:
             wav, src_sr = _decode_stereo(audio_bytes)
         except Exception as exc:
             logger.warning("decode failed %s: %s", key, exc)
             continue
         stereo = _prepare_stereo(wav, src_sr, target_sr)
-        total_sec = stereo.shape[-1] / target_sr
+        items.append(_DecodedItem(
+            key=key,
+            stereo=stereo,
+            alignments=list(align_a) + list(align_b),
+            duration_sec=float(stereo.shape[-1] / target_sr),
+            target_sr=target_sr,
+        ))
+    return items
 
-        combined_alignments = list(align_a) + list(align_b)
 
-        # Slide a fixed-length window across the dialogue, emitting both
-        # channel orderings for every window.
+def _iter_decoded_items(
+    items: list[_DecodedItem],
+    tokenizer: InterleavedTokenizer,
+) -> Iterator[Sample]:
+    """GPU: mimi.encode + build_sample for pre-decoded items."""
+    duration_sec = tokenizer.duration_sec
+
+    for item in items:
         start_sec = 0.0
-        while start_sec < total_sec:
-            end_sec = min(start_sec + duration_sec, total_sec)
-            start_samp = int(start_sec * target_sr)
-            end_samp = int(end_sec * target_sr)
+        while start_sec < item.duration_sec:
+            end_sec = min(start_sec + duration_sec, item.duration_sec)
+            start_samp = int(start_sec * item.target_sr)
+            end_samp = int(end_sec * item.target_sr)
             if end_samp <= start_samp:
                 break
-            window = stereo[:, start_samp:end_samp]
+            window = item.stereo[:, start_samp:end_samp]
 
-            # Orientation 1: ch0 is main (SPEAKER_A)
             yield _build_sample(
-                tokenizer, window, combined_alignments,
-                start_sec, MAIN_SPEAKER_A, key,
+                tokenizer, window, item.alignments,
+                start_sec, MAIN_SPEAKER_A, item.key,
             )
-
-            # Orientation 2: swap channels, ch0 becomes the original ch1
-            # which we labeled SPEAKER_B — use it as main.
             swapped = window[[1, 0], :]
             yield _build_sample(
-                tokenizer, swapped, combined_alignments,
-                start_sec, MAIN_SPEAKER_B, key,
+                tokenizer, swapped, item.alignments,
+                start_sec, MAIN_SPEAKER_B, item.key,
             )
-
             start_sec += duration_sec
 
 
@@ -252,6 +296,10 @@ def _build_sample(
         return Sample(codes, None)
 
 
+NUM_DECODE_WORKERS = 4  # CPU threads for tar reading + MP3 decoding
+PREFETCH_SHARDS = 2     # How many shards to pre-decode ahead
+
+
 def iter_wds_dataset(
     source: WDSDataSource,
     tokenizer: InterleavedTokenizer,
@@ -264,9 +312,11 @@ def iter_wds_dataset(
     """Main entry point: yields Samples for a WDSDataSource.
 
     Shards are round-robined across data-parallel ranks so each rank owns a
-    disjoint subset.
+    disjoint subset. CPU-heavy decoding is done in background threads so
+    GPU doesn't wait for I/O.
     """
     pairs = source.pairs()
+    target_sr = tokenizer.mimi.sample_rate
     epoch = 1
     rng: np.random.RandomState | None = None
     if shuffle_at_epoch:
@@ -277,10 +327,38 @@ def iter_wds_dataset(
         if shuffle_at_epoch and rng is not None:
             rng.shuffle(shard_order)
 
-        for idx in shard_order[rank::world_size]:
-            shard_path, transcript_path = pairs[idx]
-            for sample in _iter_shard(shard_path, transcript_path, tokenizer):
-                yield sample
+        my_shards = shard_order[rank::world_size]
+
+        # Pre-decode shards in background threads. The main thread only
+        # does mimi.encode + _build_sample (GPU ops).
+        with ThreadPoolExecutor(max_workers=NUM_DECODE_WORKERS) as pool:
+            # Submit first batch of prefetch jobs.
+            futures = {}
+            for i, idx in enumerate(my_shards[:PREFETCH_SHARDS]):
+                sp, tp = pairs[idx]
+                futures[i] = pool.submit(_decode_shard_items, sp, tp, target_sr)
+
+            for i, idx in enumerate(my_shards):
+                # Wait for the current shard's decoded items.
+                if i in futures:
+                    items = futures.pop(i).result()
+                else:
+                    # Shouldn't happen, but fallback to sync decode.
+                    sp, tp = pairs[idx]
+                    items = _decode_shard_items(sp, tp, target_sr)
+
+                # Submit prefetch for a future shard.
+                next_i = i + PREFETCH_SHARDS
+                if next_i < len(my_shards):
+                    next_idx = my_shards[next_i]
+                    sp, tp = pairs[next_idx]
+                    futures[next_i] = pool.submit(
+                        _decode_shard_items, sp, tp, target_sr,
+                    )
+
+                # GPU: mimi encode + build samples (main thread).
+                for sample in _iter_decoded_items(items, tokenizer):
+                    yield sample
 
         if is_finite:
             return

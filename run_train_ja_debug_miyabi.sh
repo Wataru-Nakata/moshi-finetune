@@ -1,7 +1,7 @@
 #!/bin/bash
-#PBS -q regular-g
-#PBS -l select=8
-#PBS -l walltime=48:00:00
+#PBS -q debug-g
+#PBS -l select=2
+#PBS -l walltime=00:30:00
 #PBS -W group_list=gj18
 #PBS -r y
 #PBS -N moshi_train_ja
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-NUM_NODES=8
+NUM_NODES=2
 GPUS_PER_NODE=1
 CONFIG=example/moshi_7B_ja_wds_full_ddp.yaml
 
@@ -33,7 +33,7 @@ export LD_LIBRARY_PATH="/work/gj18/e43001/miniconda3/lib:/work/gj18/e43001/minic
 
 # NCCL / FSDP tuning for GH200
 export NCCL_IB_DISABLE=0
-export NCCL_DEBUG=WARN
+export NCCL_DEBUG=INFO
 export NCCL_SOCKET_IFNAME=^lo,docker
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=4
@@ -60,13 +60,16 @@ echo "CONFIG=${CONFIG}"
 cat "${PBS_NODEFILE}" | sort -u
 
 mpirun -np ${NUM_NODES} --map-by ppr:1:node --max-restarts 0 \
-    -x PATH -x LD_LIBRARY_PATH -x LIBRARY_PATH -x CPATH \
-    -x NCCL_IB_DISABLE -x NCCL_DEBUG \
-    -x NCCL_SOCKET_IFNAME -x PYTORCH_CUDA_ALLOC_CONF -x OMP_NUM_THREADS \
-    -x TOKENIZERS_PARALLELISM \
-    -x WANDB_API_KEY -x WANDB_DIR -x TORCHDYNAMO_DISABLE \
     bash -c '
     set +e
+    # export TORCHDYNAMO_DISABLE=1  # Patched hints.py for triton 3.3 compat
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+    export OMP_NUM_THREADS=4
+    export TOKENIZERS_PARALLELISM=false
+    export NCCL_IB_HCA=mlx5_0
+    export NCCL_SOCKET_IFNAME=ibP2s2
+    export NCCL_IB_DISABLE=0
+    export NCCL_DEBUG=INFO
     NODE_RANK=${OMPI_COMM_WORLD_RANK}
     LOG_FILE='"${PROJECT_DIR}"'/logs/train_node${NODE_RANK}.log
 

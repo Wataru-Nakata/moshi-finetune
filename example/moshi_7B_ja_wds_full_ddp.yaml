@@ -8,7 +8,7 @@
 data:
   eval_data: ''
   shuffle: true
-  train_data: 'wds:/work/gj18/e43001/github.com/podcast_crawl/data/wds_ja_filtered+/work/gj18/e43001/github.com/podcast_crawl/data/wds_ja_transcripts'
+  train_data: 'tokens:/work/gj18/e43001/github.com/moshi-finetune/data/tokens_test'
 
 moshi_paths:
   hf_repo_id: "kyutai/moshiko-pytorch-bf16"
@@ -20,7 +20,7 @@ lora:
 save_adapters: false
 
 # DDP instead of FSDP (new flag; defaults to "fsdp" elsewhere).
-parallelism: ddp
+parallelism: fsdp
 
 first_codebook_weight_multiplier: 100.
 text_padding_weight: .5
@@ -29,8 +29,11 @@ text_padding_weight: .5
 # 300 s windows cover most dialogues in one pass. Full fine-tuning +
 # longer sequences = more activation memory, so we keep batch_size small
 # per GPU and accumulate via num_microbatches.
+# FSDP across 8 nodes: optimizer state sharded 8-way (~9GB/node)
+# + model shards (~2GB/node) + activations. Plenty of headroom.
+# effective_batch = 2 nodes × 4 batch × 8 microbatch = 64
 duration_sec: 300
-batch_size: 2
+batch_size: 4
 num_microbatches: 8
 max_steps: 20000
 gradient_checkpointing: true

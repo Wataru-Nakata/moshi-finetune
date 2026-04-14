@@ -22,7 +22,16 @@ def get_world_size() -> int:
 
 
 def visible_devices() -> List[int]:
-    return [int(d) for d in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
+    # PBS may set CUDA_VISIBLE_DEVICES to GPU UUIDs (e.g. "GPU-5e648ed8-...")
+    # instead of integer indices. Fall back to range(device_count) in that case.
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if not raw:
+        return list(range(torch.cuda.device_count()))
+    parts = raw.split(",")
+    try:
+        return [int(d) for d in parts]
+    except ValueError:
+        return list(range(len(parts)))
 
 
 def set_device():

@@ -12,6 +12,7 @@ import torch.distributed as dist
 from finetune.distributed import get_rank
 
 from .interleaver import InterleavedTokenizer, Sample
+from .tokenized_dataset import TokenizedDataSource, iter_tokenized_dataset
 from .wds_dataset import WDSDataSource, iter_wds_dataset
 
 logger = logging.getLogger("dataset")
@@ -98,7 +99,7 @@ def parse_data_sources(
         matching ``*.jsonl`` files produced by ``scripts/annotate_wds.py``.
     """
     seen: set[str] = set()
-    sources: list[DataDir | DataFile | WDSDataSource] = []
+    sources: list[DataDir | DataFile | WDSDataSource | TokenizedDataSource] = []
     weights: list[float] = []
 
     sample_sources = pretrain_data
@@ -106,6 +107,27 @@ def parse_data_sources(
     for source in sample_sources.strip().split(","):
         source = source.strip()
         if not source:
+            continue
+
+        if source.startswith("tokens:"):
+            body = source[len("tokens:"):]
+            weight = 1.0
+            if ":" in body:
+                maybe_body, maybe_weight = body.rsplit(":", 1)
+                try:
+                    weight = float(maybe_weight)
+                    body = maybe_body
+                except ValueError:
+                    pass
+            tokens_root = Path(body)
+            if not tokens_root.exists():
+                raise FileNotFoundError(f"tokens root does not exist: {tokens_root}")
+            key = f"tokens:{tokens_root}"
+            assert key not in seen, f"{key} seems to be duplicated."
+            assert weight > 0
+            sources.append(TokenizedDataSource(root=tokens_root))
+            weights.append(weight)
+            seen.add(key)
             continue
 
         if source.startswith("wds:"):
@@ -244,6 +266,18 @@ def get_dataset_iterator(
     seed: int | None,
     shuffle_at_epoch: bool,
 ) -> Iterator[Sample]:
+    if isinstance(source, TokenizedDataSource):
+        yield from iter_tokenized_dataset(
+            source=source,
+            tokenizer=instruct_tokenizer,
+            rank=rank,
+            world_size=world_size,
+            is_finite=is_finite,
+            shuffle_at_epoch=shuffle_at_epoch,
+            seed=seed,
+        )
+        return
+
     if isinstance(source, WDSDataSource):
         yield from iter_wds_dataset(
             source=source,
